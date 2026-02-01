@@ -100,7 +100,8 @@ var sqlColtypeToAvroTypeMap = map[string]avroType{
 
 type avroNamedType struct {
 	avroType
-	Name string
+	Name     string
+	Nullable bool
 }
 
 func sqlxRowsToAvroCol(rows *sqlx.Rows) ([]*avroNamedType, error) {
@@ -118,7 +119,8 @@ func sqlxRowsToAvroCol(rows *sqlx.Rows) ([]*avroNamedType, error) {
 				colType.DatabaseTypeName(), colType.Name())
 		}
 
-		avroCol := &avroNamedType{avroType: avroType, Name: colType.Name()}
+		nullable, _ := colType.Nullable()
+		avroCol := &avroNamedType{avroType: avroType, Name: colType.Name(), Nullable: nullable}
 		if colType.DatabaseTypeName() == "BIT" {
 			avroCol.isBit = true
 		}
@@ -167,13 +169,13 @@ var rawTypeToAvroTypeMap = map[string]avro.Type{
 
 var rawTypeRe = regexp.MustCompile(`(\([^)]+\))`)
 
-func mysqlSchemaToAvroCol(tableCol mysqlschema.TableColumn) (*avroNamedType, error) {
+func mysqlSchemaToAvroCol(tableCol mysqlschema.TableColumn, nullable bool) (*avroNamedType, error) {
 	avroType, ok := mysqlschemaTypeToAvroTypeMap[tableCol.Type]
 	if !ok {
 		return nil, fmt.Errorf("unsupported column type %s for column %s", tableCol.RawType, tableCol.Name)
 	}
 
-	// Numeric type names could contain the total number of digits that can be stored.
+	// Numeric type names could contain size specifications (e.g., DECIMAL(10,2)).
 	// Remove any value in parenthesis to understand real type.
 	// https://dev.mysql.com/doc/refman/8.0/en/numeric-type-syntax.html
 	rawType := rawTypeRe.ReplaceAllString(tableCol.RawType, "")
@@ -186,7 +188,7 @@ func mysqlSchemaToAvroCol(tableCol mysqlschema.TableColumn) (*avroNamedType, err
 		avroType.Type = avro.Double
 	}
 
-	avroColType := &avroNamedType{avroType: avroType, Name: tableCol.Name}
+	avroColType := &avroNamedType{avroType: avroType, Name: tableCol.Name, Nullable: nullable}
 	finalType, ok := rawTypeToAvroTypeMap[rawType]
 	if ok {
 		avroColType.Type = finalType
@@ -196,9 +198,11 @@ func mysqlSchemaToAvroCol(tableCol mysqlschema.TableColumn) (*avroNamedType, err
 }
 
 func colTypeToAvroField(avroCol *avroNamedType) (*avro.Field, error) {
+	var fieldSchema avro.Schema
+
 	if avroCol.isBit {
-		// Current limitations in the mysql driver that we use don't allow use
-		// to get the N from BIT(N) mysql columns. To track support for this
+		// Current limitations in the mysql driver that we use don't allow us
+		// to get to the N from BIT(N) mysql columns. To track support for this
 		// feature refer to https://github.com/go-sql-driver/mysql/issues/1672
 		fixed8Size := 8
 
@@ -207,7 +211,16 @@ func colTypeToAvroField(avroCol *avroNamedType) (*avro.Field, error) {
 			return nil, fmt.Errorf("failed to create fixed schema for bit column %s: %w", avroCol.Name, err)
 		}
 
-		field, err := avro.NewField(avroCol.Name, fixed)
+		if avroCol.Nullable {
+			fieldSchema, err = avro.NewUnionSchema([]avro.Schema{avro.NewNullSchema(), fixed})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create nullable union schema for bit column %s: %w", avroCol.Name, err)
+			}
+		} else {
+			fieldSchema = fixed
+		}
+
+		field, err := avro.NewField(avroCol.Name, fieldSchema)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create avro field for bit column %s: %w", avroCol.Name, err)
 		}
@@ -217,7 +230,17 @@ func colTypeToAvroField(avroCol *avroNamedType) (*avro.Field, error) {
 
 	primitive := avro.NewPrimitiveSchema(avroCol.Type, nil)
 
-	nameField, err := avro.NewField(avroCol.Name, primitive)
+	if avroCol.Nullable {
+		var err error
+		fieldSchema, err = avro.NewUnionSchema([]avro.Schema{avro.NewNullSchema(), primitive})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create nullable union schema for column %s: %w", avroCol.Name, err)
+		}
+	} else {
+		fieldSchema = primitive
+	}
+
+	nameField, err := avro.NewField(avroCol.Name, fieldSchema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create avro field for column %s: %w", avroCol.Name, err)
 	}
@@ -245,6 +268,8 @@ func (s *schemaMapper) createKeySchema(
 func (s *schemaMapper) createSchema(
 	ctx context.Context, table string, mysqlCols []*avroNamedType,
 ) (*schemaSubjectVersion, error) {
+	// Schema is cached after first creation. If the table schema changes
+	// (e.g., column becomes nullable), restart the connector to refresh.
 	if s.schema != nil {
 		return s.schema, nil
 	}
@@ -298,11 +323,9 @@ func (s *schemaMapper) formatValue(ctx context.Context, column string, value any
 	// dependencies. We need this to make sure that a row emitted in snapshot mode
 	// and updated in cdc mode have the same schema.
 
-	// We manually convert nil values into the go zero value equivalent so that
-	// we don't need to handle NULL complexity into the schema.
-	// However, we might want to reflect nullability of the datatype in the future.
+	// Preserve nil values for nullable columns
 	if value == nil {
-		return defaultValueForType(t.Type)
+		return nil
 	}
 
 	switch t.Type {
@@ -445,36 +468,6 @@ func (s *schemaMapper) formatValue(ctx context.Context, column string, value any
 	return value
 }
 
-func defaultValueForType(t avro.Type) any {
-	switch t {
-	case avro.Array:
-		return []any{}
-	case avro.Map:
-		return map[string]any{}
-	case avro.String:
-		return ""
-	case avro.Bytes:
-		return []byte{}
-	case avro.Int:
-		return int32(0)
-	case avro.Long:
-		return int64(0)
-	case avro.Float:
-		return float32(0)
-	case avro.Double:
-		return float64(0)
-	case avro.Boolean:
-		return false
-	case avro.Null:
-		return nil
-	case avro.Record, avro.Error, avro.Ref, avro.Enum, avro.Fixed, avro.Union:
-		return nil
-	default:
-		return nil
-	}
-}
-
-// int64ToBytes transforms an int64 to a slice of bytes without leading zeros.
 func int64ToBytes(i int64) []byte {
 	bs := [8]byte{}
 

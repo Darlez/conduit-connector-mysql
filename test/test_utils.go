@@ -115,16 +115,19 @@ type User struct {
 }
 
 var (
+	// userPayloadSchema is used for both snapshot and CDC mode (accurate nullability from information_schema)
 	userPayloadSchema = AvroSchema{
 		Name: "mysql.users_payload",
 		Type: "record",
 		Fields: []AvroSchemaField{
+			// id is primary key, NOT NULL in database (accurate from information_schema)
 			{Name: "id", Type: "long"},
-			{Name: "username", Type: "string"},
-			{Name: "email", Type: "string"},
-			{Name: "created_at", Type: "string"},
+			{Name: "username", Type: []any{"null", "string"}},
+			{Name: "email", Type: []any{"null", "string"}},
+			{Name: "created_at", Type: []any{"null", "string"}},
 		},
 	}
+	// userKeySchema is used for both snapshot and CDC mode (accurate nullability from information_schema)
 	userKeySchema = AvroSchema{
 		Name:   "mysql.users_key",
 		Type:   "record",
@@ -140,7 +143,7 @@ type AvroSchema struct {
 
 type AvroSchemaField struct {
 	Name string `json:"name"`
-	Type string `json:"type"`
+	Type any    `json:"type"`
 }
 
 func (u User) Update() User {
@@ -315,6 +318,8 @@ func AssertUserSnapshot(ctx context.Context, is *is.I, user User, rec opencdc.Re
 }
 
 func assertMetadata(ctx context.Context, is *is.I, metadata opencdc.Metadata) {
+	is.Helper()
+
 	col, err := metadata.GetCollection()
 	is.NoErr(err)
 	is.Equal(col, "users")
@@ -325,6 +330,8 @@ func assertMetadata(ctx context.Context, is *is.I, metadata opencdc.Metadata) {
 }
 
 func assertSchema(ctx context.Context, is *is.I, metadata opencdc.Metadata) {
+	is.Helper()
+
 	{ // payload schema
 		ver, err := metadata.GetPayloadSchemaVersion()
 		is.NoErr(err)

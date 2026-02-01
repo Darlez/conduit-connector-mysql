@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/conduitio-labs/conduit-connector-mysql/common"
@@ -99,6 +100,8 @@ func (c *cdcIterator) start(ctx context.Context) error {
 		c.parsedRecordsC,
 		c.config.tableKeys,
 		startPosition,
+		c.config.db,
+		c.config.mysqlConfig.DBName,
 	)
 
 	go func() {
@@ -217,6 +220,18 @@ type cdcEventHandler struct {
 	tablePrimaryKeys common.TableKeys
 
 	onRowsChange onRowChangeFn
+
+	// db is used to query information_schema for column nullability
+	db *sqlx.DB
+
+	// dbName is the database name for information_schema queries
+	dbName string
+
+	// columnNullabilityCache stores nullability info per table/column
+	// Map structure: tableName -> columnName -> isNullable
+	columnNullabilityCache map[string]map[string]bool
+	// columnNullabilityMu protects columnNullabilityCache from concurrent access
+	columnNullabilityMu sync.RWMutex
 }
 
 func newCdcEventHandler(
@@ -226,17 +241,64 @@ func newCdcEventHandler(
 	parsedRecordsC chan opencdc.Record,
 	tablesPrimaryKeys common.TableKeys,
 	startPosition common.CdcPosition,
+	db *sqlx.DB,
+	dbName string,
 ) *cdcEventHandler {
 	h := &cdcEventHandler{
-		canal:            canal,
-		canalDoneC:       canalDoneC,
-		parsedRecordsC:   parsedRecordsC,
-		tablePrimaryKeys: tablesPrimaryKeys,
+		canal:                  canal,
+		canalDoneC:             canalDoneC,
+		parsedRecordsC:         parsedRecordsC,
+		tablePrimaryKeys:       tablesPrimaryKeys,
+		db:                     db,
+		dbName:                 dbName,
+		columnNullabilityCache: make(map[string]map[string]bool),
 	}
 
 	h.onRowsChange = h.handleSingleRowChange(ctx, startPosition)
 
 	return h
+}
+
+// getOrCreateColumnNullability queries information_schema.columns for nullability
+// and caches the result. Returns true if column is nullable, false otherwise.
+func (h *cdcEventHandler) getOrCreateColumnNullability(
+	ctx context.Context,
+	tableName, columnName string,
+) (bool, error) {
+	// Check cache with read lock
+	h.columnNullabilityMu.RLock()
+	cache, ok := h.columnNullabilityCache[tableName]
+	if ok {
+		if isNullable, found := cache[columnName]; found {
+			h.columnNullabilityMu.RUnlock()
+			return isNullable, nil
+		}
+		// Table cached but column not found - column doesn't exist or was dropped
+		sdk.Logger(ctx).Warn().Msgf("column %q not found in cached table %q", columnName, tableName)
+		h.columnNullabilityMu.RUnlock()
+		return true, nil
+	}
+	h.columnNullabilityMu.RUnlock()
+
+	// Table not cached - query all columns for this table
+	tableNullability, err := common.QueryColumnNullability(ctx, h.db, h.dbName, tableName)
+	if err != nil {
+		//nolint:wrapcheck // error already wrapped by QueryColumnNullability
+		return true, err
+	}
+
+	// Cache the result with write lock
+	h.columnNullabilityMu.Lock()
+	h.columnNullabilityCache[tableName] = tableNullability
+	h.columnNullabilityMu.Unlock()
+
+	// Return the result for this specific column
+	if isNullable, found := tableNullability[columnName]; found {
+		return isNullable, nil
+	}
+
+	// Column not found - conservatively assume nullable
+	return true, nil
 }
 
 func (h *cdcEventHandler) createMetadata(
@@ -245,16 +307,21 @@ func (h *cdcEventHandler) createMetadata(
 	keySchema *schemaMapper,
 	payloadSchema *schemaMapper,
 ) (opencdc.Metadata, error) {
+	tableName := e.Table.Name
+
 	payloadAvroCols := make([]*avroNamedType, len(e.Table.Columns))
 	for i, col := range e.Table.Columns {
-		avroCol, err := mysqlSchemaToAvroCol(col)
+		isNullable, err := h.getOrCreateColumnNullability(ctx, tableName, col.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get column nullability: %w", err)
+		}
+
+		avroCol, err := mysqlSchemaToAvroCol(col, isNullable)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse avro cols: %w", err)
 		}
 		payloadAvroCols[i] = avroCol
 	}
-
-	tableName := e.Table.Name
 
 	payloadSubver, err := payloadSchema.createPayloadSchema(ctx, tableName, payloadAvroCols)
 	if err != nil {

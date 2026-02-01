@@ -195,3 +195,43 @@ func GetPrimaryKeys(db keyQuerier, database, table string) (PrimaryKeys, error) 
 
 	return keys, nil
 }
+
+// ColumnNullability maps column names to their nullability status.
+type ColumnNullability map[string]bool
+
+// querier allows querying with context.
+type querier interface {
+	QueryxContext(ctx context.Context, query string, args ...any) (*sqlx.Rows, error)
+}
+
+// QueryColumnNullability queries information_schema.columns to get the nullability
+// status for all columns in the specified table. Returns a map where keys are
+// column names and values are true if the column is nullable.
+func QueryColumnNullability(ctx context.Context, db querier, dbName, tableName string) (ColumnNullability, error) {
+	columnNullability := make(ColumnNullability)
+	rows, err := db.QueryxContext(ctx, `
+		SELECT column_name, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = ?
+	`, dbName, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query column nullability for table %s: %w", tableName, err)
+	}
+	defer func() {
+		//nolint:errcheck,sqlclosecheck // read-only query, close error not critical
+		_ = rows.Close()
+	}()
+
+	for rows.Next() {
+		var colName, isNullable string
+		if err := rows.Scan(&colName, &isNullable); err != nil {
+			return nil, fmt.Errorf("failed to scan column nullability for table %s: %w", tableName, err)
+		}
+		columnNullability[colName] = isNullable == "YES"
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating column nullability for table %s: %w", tableName, err)
+	}
+
+	return columnNullability, nil
+}

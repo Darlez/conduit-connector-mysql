@@ -32,6 +32,17 @@ The position of the table is currently not recorded, so the unsafe snapshot will
 
 The source connector uses [avro](https://avro.apache.org/docs/1.11.1/specification/) to decode mysql rows. Here's the MySQL datatype to avro datatype equivalence that the connector uses:
 
+#### Nullable Columns
+
+The connector properly preserves `NULL` values for nullable columns in both snapshot and CDC modes:
+
+- **Snapshot mode**: Column nullability is determined from `sqlx.ColumnTypes` metadata returned by the database driver
+- **CDC mode**: Column nullability is queried from `information_schema.columns` and cached for performance
+
+For nullable columns, the connector creates Avro [union schemas](https://avro.apache.org/docs/1.11.1/specification/#unions) with the format `["null", "type"]`, where `type` is the mapped Avro type from the table below. This allows records to contain either a null value or the actual data type.
+
+**Note**: Non-nullable columns always use the primitive Avro types shown below, while nullable columns use union types.
+
 | MySQL Type | Avro Type |
 | ---------- | --------- |
 | TINYINT    | int       |
@@ -308,3 +319,7 @@ Run `make test` to run all tests.
 The Docker compose file at `test/docker-compose.yml` can be used to run the required resource locally. It includes [adminer](https://www.adminer.org/) for database management.
 
 Use the `TRACE=true` environment variable to enable trace logs when running tests.
+
+## Development
+
+For guidelines on contributing to this connector, including build commands, code style conventions, and testing requirements, see [AGENTS.md](./AGENTS.md).
