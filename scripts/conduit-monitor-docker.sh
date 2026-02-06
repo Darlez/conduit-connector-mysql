@@ -3,7 +3,7 @@
 # Conduit Pipeline Monitor and Shutdown Script for Docker
 #
 # This script starts Conduit with configurable CLI parameters, monitors a pipeline,
-# and shuts down when complete. Designed to run inside a Docker container.
+# detects snapshot completion via log messages, and gracefully stops the pipeline via API.
 #
 # All parameters are configured via environment variables.
 #
@@ -20,9 +20,11 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 CONDUIT_PID=""
 SHUTDOWN_TIMEOUT=30
 POLL_INTERVAL=2
+SNAPSHOT_CHECK_INTERVAL=5
+STARTUP_FAILED=0
+SNAPSHOT_COMPLETED=0
 
 # Extract port from API_HTTP_ADDRESS for internal API calls
-# Handle formats like ":18080", "0.0.0.0:18080", "localhost:18080"
 API_PORT=$(echo "$API_HTTP_ADDRESS" | sed 's/.*://')
 API_URL="http://localhost:${API_PORT}/v1"
 
@@ -31,17 +33,23 @@ if [ -t 1 ]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
     YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
     NC='\033[0m'
 else
     RED=''
     GREEN=''
     YELLOW=''
+    BLUE=''
     NC=''
 fi
 
 # Logging functions
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_debug() {
+    echo -e "${BLUE}[DEBUG]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
 log_warn() {
@@ -56,12 +64,12 @@ log_error() {
 check_dependencies() {
     if ! command -v curl &> /dev/null; then
         log_error "curl is required but not installed."
-        exit 1
+        return 1
     fi
     
     if ! command -v jq &> /dev/null; then
         log_error "jq is required but not installed."
-        exit 1
+        return 1
     fi
 }
 
@@ -71,15 +79,22 @@ setup_logging() {
     log_dir=$(dirname "$LOG_FILE")
     if [ ! -d "$log_dir" ]; then
         log_info "Creating log directory: $log_dir"
-        mkdir -p "$log_dir"
+        mkdir -p "$log_dir" || {
+            log_error "Failed to create log directory: $log_dir"
+            return 1
+        }
     fi
     
     # Clear or create log file
-    > "$LOG_FILE"
+    > "$LOG_FILE" || {
+        log_error "Failed to create log file: $LOG_FILE"
+        return 1
+    }
     log_info "Logging to: $LOG_FILE"
 }
 
 # Start Conduit with specified parameters
+# Returns 0 on success, 1 on failure
 start_conduit() {
     log_info "Starting Conduit with configuration:"
     log_info "  --api.http.address $API_HTTP_ADDRESS"
@@ -89,8 +104,18 @@ start_conduit() {
     
     if ! command -v conduit &> /dev/null; then
         log_error "Conduit binary not found in PATH"
-        exit 1
+        return 1
     fi
+    
+    # Check if pipelines path exists
+    if [ ! -d "$PIPELINES_PATH" ]; then
+        log_error "Pipelines path does not exist: $PIPELINES_PATH"
+        return 1
+    fi
+    
+    # List pipeline files for debugging
+    log_info "Pipeline files in $PIPELINES_PATH:"
+    ls -la "$PIPELINES_PATH" 2>/dev/null || log_warn "Could not list pipeline files"
     
     # Start Conduit with CLI parameters, redirecting stdout and stderr to log file
     conduit run \
@@ -108,30 +133,41 @@ start_conduit() {
     local retries=0
     local max_retries=60
     
-    while ! curl -s "$API_URL/pipelines" > /dev/null 2>&1; do
-        if [ $retries -ge $max_retries ]; then
-            log_error "Conduit failed to start after $max_retries attempts"
-            log_error "Last 50 lines of log:"
-            tail -n 50 "$LOG_FILE" || true
-            kill -TERM "$CONDUIT_PID" 2>/dev/null || true
-            exit 1
+    while true; do
+        # Check if API is ready
+        if curl -s "$API_URL/pipelines" > /dev/null 2>&1; then
+            log_info "Conduit API is ready"
+            return 0
         fi
         
+        # Check if we've exceeded max retries
+        if [ $retries -ge $max_retries ]; then
+            log_error "Conduit failed to start after $max_retries attempts"
+            log_error "Last 100 lines of log:"
+            tail -n 100 "$LOG_FILE" 2>/dev/null || true
+            return 1
+        fi
+        
+        # Check if Conduit process is still running
         if ! kill -0 "$CONDUIT_PID" 2>/dev/null; then
             log_error "Conduit process died unexpectedly during startup"
-            log_error "Last 50 lines of log:"
-            tail -n 50 "$LOG_FILE" || true
-            exit 1
+            log_error "Last 100 lines of log:"
+            tail -n 100 "$LOG_FILE" 2>/dev/null || true
+            return 1
         fi
         
         sleep 1
         ((retries++))
+        
+        # Progress indicator every 10 seconds
+        if [ $((retries % 10)) -eq 0 ]; then
+            log_info "Still waiting for API... ($retries seconds)"
+        fi
     done
-    
-    log_info "Conduit API is ready"
 }
 
 # Get pipeline status
+# Returns: STATUS_* string or error indicator
 get_pipeline_status() {
     local response
     local http_code
@@ -151,11 +187,12 @@ get_pipeline_status() {
         return
     fi
     
-    # Extract status from response
-    echo "$body" | jq -r '.pipeline.status' 2>/dev/null || echo "PARSE_ERROR"
+    # Extract status from response (format: state.status)
+    echo "$body" | jq -r '.state.status' 2>/dev/null || echo "PARSE_ERROR"
 }
 
 # Check if pipeline exists
+# Returns 0 on success, 1 on failure
 wait_for_pipeline() {
     log_info "Waiting for pipeline '$PIPELINE_ID' to be registered..."
     local retries=0
@@ -165,13 +202,15 @@ wait_for_pipeline() {
         local status
         status=$(get_pipeline_status)
         
-        if [ "$status" != "CONNECTION_ERROR" ] && [ "$status" != "API_ERROR:404" ]; then
-            log_info "Pipeline '$PIPELINE_ID' is registered"
+        if [ "$status" != "CONNECTION_ERROR" ] && [ "$status" != "API_ERROR:404" ] && [ "$status" != "PARSE_ERROR" ]; then
+            log_info "Pipeline '$PIPELINE_ID' is registered (status: $status)"
             return 0
         fi
         
         if [ $retries -ge $max_retries ]; then
             log_error "Pipeline '$PIPELINE_ID' not found after $max_retries attempts"
+            log_error "Available pipelines:"
+            curl -s "$API_URL/pipelines" 2>/dev/null | jq -r '.pipelines[].id' 2>/dev/null || echo "Could not list pipelines"
             return 1
         fi
         
@@ -185,11 +224,100 @@ wait_for_pipeline() {
     done
 }
 
-# Monitor pipeline until it stops
-monitor_pipeline() {
-    log_info "Monitoring pipeline '$PIPELINE_ID'..."
+# Check if snapshot has completed by looking for the log message
+# Returns 0 if completed, 1 if not
+is_snapshot_complete() {
+    if [ ! -f "$LOG_FILE" ]; then
+        return 1
+    fi
+    
+    # Look for the snapshot completion message
+    if grep -q "snapshot completed in initial_only mode" "$LOG_FILE" 2>/dev/null; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Stop the pipeline via API
+# Returns 0 on success, 1 on failure
+stop_pipeline() {
+    log_info "Stopping pipeline '$PIPELINE_ID' via API..."
+    
+    local response
+    local http_code
+    
+    # Call the stop API with force=true to unblock blocked sources
+    response=$(curl -s -w "\n%{http_code}" -X POST \
+        "$API_URL/pipelines/$PIPELINE_ID/stop" \
+        -H "Content-Type: application/json" \
+        -d '{"force": true}' 2>/dev/null || echo -e "\n000")
+    
+    http_code=$(echo "$response" | tail -n1)
+    
+    if [ "$http_code" == "200" ] || [ "$http_code" == "202" ]; then
+        log_info "Pipeline stop request accepted (HTTP $http_code)"
+        return 0
+    else
+        log_error "Failed to stop pipeline (HTTP $http_code)"
+        return 1
+    fi
+}
+
+# Wait for pipeline to reach stopped state
+# Returns 0 when stopped, 1 on error/timeout
+wait_for_stopped() {
+    log_info "Waiting for pipeline to stop..."
+    local retries=0
+    local max_retries=30
+    
+    while true; do
+        local status
+        status=$(get_pipeline_status)
+        
+        case "$status" in
+            "STATUS_STOPPED"|"STATUS_USER_STOPPED"|"STATUS_SYSTEM_STOPPED")
+                log_info "Pipeline is stopped"
+                return 0
+                ;;
+            "STATUS_DEGRADED")
+                log_warn "Pipeline is degraded (may have errors)"
+                return 0
+                ;;
+            "CONNECTION_ERROR"|"API_ERROR"*)
+                log_error "API error while waiting for stop: $status"
+                return 1
+                ;;
+            "STATUS_RUNNING")
+                # Still running, keep waiting
+                ;;
+            *)
+                log_debug "Current status: $status"
+                ;;
+        esac
+        
+        if [ $retries -ge $max_retries ]; then
+            log_warn "Timeout waiting for pipeline to stop, forcing..."
+            return 1
+        fi
+        
+        if ! kill -0 "$CONDUIT_PID" 2>/dev/null; then
+            log_error "Conduit process died while waiting"
+            return 1
+        fi
+        
+        sleep 2
+        ((retries++))
+    done
+}
+
+# Monitor pipeline and detect snapshot completion
+# Returns 0 on success, 1 on failure
+monitor_and_stop() {
+    log_info "Monitoring pipeline '$PIPELINE_ID' for snapshot completion..."
     
     local last_status=""
+    local check_count=0
     
     while true; do
         local status
@@ -197,29 +325,51 @@ monitor_pipeline() {
         
         # Log status changes
         if [ "$status" != "$last_status" ]; then
-            log_info "Pipeline status changed to: $status"
+            log_info "Pipeline status: $status"
             last_status=$status
         fi
         
-        # Check if pipeline has stopped
+        # Check if snapshot completed
+        if [ $SNAPSHOT_COMPLETED -eq 0 ] && is_snapshot_complete; then
+            log_info "Snapshot completion detected in logs!"
+            SNAPSHOT_COMPLETED=1
+            
+            # Stop the pipeline via API
+            if stop_pipeline; then
+                # Wait for it to actually stop
+                if wait_for_stopped; then
+                    return 0
+                else
+                    return 1
+                fi
+            else
+                return 1
+            fi
+        fi
+        
+        # Check for error states
         case "$status" in
-            "STATUS_STOPPED"|"STATUS_USER_STOPPED"|"STATUS_SYSTEM_STOPPED")
-                log_info "Pipeline stopped gracefully"
-                return 0
-                ;;
             "STATUS_DEGRADED")
-                log_warn "Pipeline stopped with errors (degraded)"
-                return 0
+                log_warn "Pipeline is degraded, checking if snapshot completed..."
+                if is_snapshot_complete; then
+                    log_info "Snapshot was completed before degradation, treating as success"
+                    return 0
+                fi
+                log_error "Pipeline degraded without completing snapshot"
+                return 1
+                ;;
+            "STATUS_STOPPED"|"STATUS_USER_STOPPED"|"STATUS_SYSTEM_STOPPED")
+                if is_snapshot_complete; then
+                    log_info "Pipeline stopped after snapshot completion"
+                    return 0
+                else
+                    log_error "Pipeline stopped before completing snapshot"
+                    return 1
+                fi
                 ;;
             "CONNECTION_ERROR"|"API_ERROR"*)
-                log_error "Failed to get pipeline status: $status"
-                # Don't exit immediately, give it a few more tries
-                ;;
-            "STATUS_RUNNING"|"STATUS_STARTING"|"STATUS_RECOVERING")
-                # Pipeline is still running, continue monitoring
-                ;;
-            *)
-                log_warn "Unknown status: $status"
+                log_error "API error: $status"
+                return 1
                 ;;
         esac
         
@@ -227,6 +377,12 @@ monitor_pipeline() {
         if ! kill -0 "$CONDUIT_PID" 2>/dev/null; then
             log_error "Conduit process died unexpectedly"
             return 1
+        fi
+        
+        # Log progress every minute
+        ((check_count++))
+        if [ $((check_count % 30)) -eq 0 ]; then
+            log_info "Still monitoring... ($((check_count * POLL_INTERVAL)) seconds elapsed)"
         fi
         
         sleep $POLL_INTERVAL
@@ -274,6 +430,7 @@ output_logs() {
 }
 
 # Check for errors in logs
+# Returns 0 if no errors, 1 if errors found
 check_logs_for_errors() {
     log_info "Checking logs for error messages..."
     
@@ -283,7 +440,6 @@ check_logs_for_errors() {
     fi
     
     # Count error messages (pattern: " ERR ")
-    # Use printf to ensure clean integer output
     local error_count
     error_count=$(grep -c " ERR " "$LOG_FILE" 2>/dev/null | head -1 || echo "0")
     error_count=$(printf '%s' "$error_count" | tr -d '\n\r')
@@ -305,9 +461,15 @@ check_logs_for_errors() {
     fi
 }
 
-# Cleanup function
+# Cleanup function - handles both normal shutdown and errors
 cleanup() {
     local exit_code=$?
+    
+    # Determine if this is a startup failure
+    if [ $STARTUP_FAILED -eq 1 ]; then
+        log_error "Startup failed, outputting logs for debugging..."
+        exit_code=1
+    fi
     
     # Output logs regardless of exit status
     output_logs
@@ -317,8 +479,9 @@ cleanup() {
         exit_code=1
     fi
     
+    # Shutdown Conduit if still running
     if [ -n "$CONDUIT_PID" ] && kill -0 "$CONDUIT_PID" 2>/dev/null; then
-        log_warn "Script interrupted or failed, shutting down Conduit..."
+        log_warn "Shutting down Conduit..."
         kill -TERM "$CONDUIT_PID" 2>/dev/null || true
         sleep 2
         kill -KILL "$CONDUIT_PID" 2>/dev/null || true
@@ -342,22 +505,31 @@ main() {
     log_info "  API_URL: $API_URL"
     
     # Check dependencies
-    check_dependencies
+    if ! check_dependencies; then
+        STARTUP_FAILED=1
+        exit 1
+    fi
     
     # Setup logging
-    setup_logging
+    if ! setup_logging; then
+        STARTUP_FAILED=1
+        exit 1
+    fi
     
     # Start Conduit
-    start_conduit
+    if ! start_conduit; then
+        STARTUP_FAILED=1
+        exit 1
+    fi
     
     # Wait for pipeline to be registered
     if ! wait_for_pipeline; then
         exit 1
     fi
     
-    # Monitor pipeline
-    if ! monitor_pipeline; then
-        log_error "Monitoring failed"
+    # Monitor pipeline and stop when snapshot completes
+    if ! monitor_and_stop; then
+        log_error "Monitoring/stopping failed"
         exit 1
     fi
     
@@ -374,7 +546,8 @@ show_usage() {
 Conduit Pipeline Monitor and Shutdown Script for Docker
 
 This script starts Conduit with configurable CLI parameters, monitors a pipeline,
-and shuts down when complete. All parameters are configured via environment variables.
+detects snapshot completion via log messages, and gracefully stops the pipeline.
+All parameters are configured via environment variables.
 
 Environment Variables:
   PIPELINE_ID         ID of the pipeline to monitor (default: mysql-snapshot)
@@ -382,6 +555,14 @@ Environment Variables:
   PIPELINES_PATH      Path to pipeline configuration files (default: /etc/conduit/pipelines/)
   LOG_FILE            Path to log file (default: /etc/conduit/conduit.log)
   LOG_LEVEL           Log level: debug, info, warn, error (default: info)
+
+How it works:
+1. Starts Conduit with the specified configuration
+2. Monitors the pipeline status via API
+3. Checks log file for "snapshot completed in initial_only mode" message
+4. When detected, calls the API to stop the pipeline gracefully
+5. Waits for pipeline to reach stopped state
+6. Shuts down Conduit and exits
 
 Docker Compose Example:
   services:
@@ -397,16 +578,6 @@ Docker Compose Example:
         - ./pipelines:/etc/conduit/pipelines/
         - ./logs:/var/log/
       command: /app/conduit-monitor-docker.sh
-
-Docker CLI Example:
-  docker run -d \\
-    -e PIPELINE_ID=mysql-snapshot \\
-    -e API_HTTP_ADDRESS=:18080 \\
-    -e LOG_LEVEL=debug \\
-    -v ./pipelines:/etc/conduit/pipelines/ \\
-    -v ./logs:/var/log/ \\
-    conduit-image \\
-    /app/conduit-monitor-docker.sh
 
 Exit codes:
   0 - Pipeline completed successfully, no errors in logs

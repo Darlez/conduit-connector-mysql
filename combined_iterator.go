@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/conduitio-labs/conduit-connector-mysql/common"
@@ -153,8 +152,11 @@ func (c *combinedIterator) ReadN(ctx context.Context, n int) ([]opencdc.Record, 
 	if errors.Is(err, ErrSnapshotIteratorDone) {
 		// Check if we're in snapshot-only mode
 		if c.snapshotMode == "initial_only" {
-			sdk.Logger(ctx).Info().Msg("snapshot completed in initial_only mode, returning EOF to stop pipeline")
-			return nil, io.EOF
+			sdk.Logger(ctx).Info().Msg("snapshot completed in initial_only mode, blocking indefinitely to keep pipeline running")
+			// Block forever to keep pipeline in RUNNING state
+			// The monitoring script will detect completion and stop the pipeline via API
+			<-ctx.Done()
+			return nil, ctx.Err()
 		}
 		c.currentIterator = c.cdcIterator
 		//nolint:wrapcheck // error already wrapped in iterator
