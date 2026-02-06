@@ -64,6 +64,11 @@ type SourceConfig struct {
 	// Controls whether the snapshot is done.
 	SnapshotEnabled bool `json:"snapshot.enabled" default:"true"`
 
+	// Specifies the snapshot mode. Supported values:
+	// - "initial": Takes a snapshot of the data and then continues with CDC (default).
+	// - "initial_only": Takes a snapshot of the data and stops after completion.
+	SnapshotMode string `json:"snapshot.mode" default:"initial"`
+
 	mysqlCfg *mysql.Config
 }
 
@@ -81,6 +86,11 @@ func (s *SourceConfig) Validate(context.Context) error {
 	mysqlCfg.ParseTime = true
 
 	s.mysqlCfg = mysqlCfg
+
+	// Validate snapshot mode
+	if s.SnapshotMode != "initial" && s.SnapshotMode != "initial_only" {
+		return fmt.Errorf("invalid snapshot.mode: %q, must be either 'initial' or 'initial_only'", s.SnapshotMode)
+	}
 
 	return nil
 }
@@ -177,6 +187,7 @@ func (s *Source) Open(ctx context.Context, sdkPos opencdc.Position) (err error) 
 		disableCanalLogging:   s.config.DisableLogs,
 		fetchSize:             s.config.FetchSize,
 		snapshotEnabled:       s.config.SnapshotEnabled,
+		snapshotMode:          s.config.SnapshotMode,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot iterator: %w", err)

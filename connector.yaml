@@ -17,6 +17,14 @@ specification:
     [opencdc.StructuredData](https://conduit.io/docs/using/opencdc-record#structured-data),
     with each key being a column and each value being that column's value.
 
+    #### Snapshot Modes
+
+    The connector supports different snapshot modes via the `snapshot.mode` configuration parameter:
+
+    - **initial** (default): Performs a snapshot of the data and then continues with CDC mode.
+    - **initial_only**: Performs a snapshot of the data and stops once complete. Useful for read-only databases
+      or one-time data migrations.
+
     ### Change Data Capture mode
 
     When the connector switches to CDC mode, it starts streaming changes from the
@@ -176,6 +184,16 @@ specification:
         type: bool
         default: "true"
         validations: []
+      - name: snapshot.mode
+        description: |-
+          Specifies the snapshot mode. Supported values:
+          - "initial": Takes a snapshot of the data and then continues with CDC (default).
+          - "initial_only": Takes a snapshot of the data and stops after completion.
+        type: string
+        default: "initial"
+        validations:
+          - type: inclusion
+            value: "initial,initial_only"
       - name: snapshot.fetchSize
         description: Limits how many rows should be retrieved on each database fetch on snapshot mode.
         type: int

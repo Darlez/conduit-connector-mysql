@@ -16,6 +16,8 @@ package mysql
 
 import (
 	"context"
+	"errors"
+	"io"
 	"testing"
 
 	"github.com/conduitio-labs/conduit-connector-mysql/common"
@@ -69,4 +71,69 @@ func TestCombinedIterator_SnapshotAndCDC(t *testing.T) {
 	testutils.ReadAndAssertUpdate(ctx, is, iterator, user1, user1Updated)
 	testutils.ReadAndAssertUpdate(ctx, is, iterator, user2, user2Updated)
 	testutils.ReadAndAssertUpdate(ctx, is, iterator, user3, user3Updated)
+}
+
+func TestCombinedIterator_SnapshotOnly(t *testing.T) {
+	ctx := testutils.TestContext(t)
+	is := is.New(t)
+	db := testutils.NewDB(t)
+
+	testutils.CreateUserTable(is, db)
+
+	user1 := testutils.InsertUser(is, db, 1)
+	user2 := testutils.InsertUser(is, db, 2)
+	user3 := testutils.InsertUser(is, db, 3)
+
+	config, err := mysql.ParseDSN(testutils.DSN)
+	is.NoErr(err)
+
+	iterator, err := newCombinedIterator(ctx, combinedIteratorConfig{
+		db:                  db.SqlxDB,
+		tableKeys:           testutils.TablePrimaryKeys,
+		database:            "meroxadb",
+		serverID:            testutils.ServerID,
+		mysqlConfig:         config,
+		disableCanalLogging: true,
+		snapshotEnabled:     true,
+		snapshotMode:        "initial_only",
+	})
+	is.NoErr(err)
+	defer func() { is.NoErr(iterator.Teardown(ctx)) }()
+
+	// Read all snapshot records
+	testutils.ReadAndAssertSnapshot(ctx, is, iterator, user1)
+	testutils.ReadAndAssertSnapshot(ctx, is, iterator, user2)
+	testutils.ReadAndAssertSnapshot(ctx, is, iterator, user3)
+
+	// After all snapshot records are read, should return io.EOF
+	_, err = iterator.ReadN(ctx, 1)
+	is.True(errors.Is(err, io.EOF))
+}
+
+func TestCombinedIterator_SnapshotOnly_EmptyTable(t *testing.T) {
+	ctx := testutils.TestContext(t)
+	is := is.New(t)
+	db := testutils.NewDB(t)
+
+	testutils.CreateUserTable(is, db)
+
+	config, err := mysql.ParseDSN(testutils.DSN)
+	is.NoErr(err)
+
+	iterator, err := newCombinedIterator(ctx, combinedIteratorConfig{
+		db:                  db.SqlxDB,
+		tableKeys:           testutils.TablePrimaryKeys,
+		database:            "meroxadb",
+		serverID:            testutils.ServerID,
+		mysqlConfig:         config,
+		disableCanalLogging: true,
+		snapshotEnabled:     true,
+		snapshotMode:        "initial_only",
+	})
+	is.NoErr(err)
+	defer func() { is.NoErr(iterator.Teardown(ctx)) }()
+
+	// Empty table should immediately return io.EOF
+	_, err = iterator.ReadN(ctx, 1)
+	is.True(errors.Is(err, io.EOF))
 }

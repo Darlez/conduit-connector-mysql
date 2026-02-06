@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/conduitio-labs/conduit-connector-mysql/common"
@@ -32,6 +33,7 @@ type combinedIterator struct {
 	cdcIterator      common.Iterator
 
 	currentIterator common.Iterator
+	snapshotMode    string
 }
 
 type combinedIteratorConfig struct {
@@ -46,6 +48,7 @@ type combinedIteratorConfig struct {
 	mysqlConfig           *mysqldriver.Config
 	disableCanalLogging   bool
 	snapshotEnabled       bool
+	snapshotMode          string
 }
 
 func newCombinedIterator(
@@ -134,6 +137,7 @@ func newCombinedIterator(
 		snapshotIterator: snapshotIterator,
 		cdcIterator:      cdcIterator,
 		currentIterator:  snapshotIterator,
+		snapshotMode:     config.snapshotMode,
 	}
 
 	return iterator, nil
@@ -147,6 +151,11 @@ func (c *combinedIterator) Ack(ctx context.Context, pos opencdc.Position) error 
 func (c *combinedIterator) ReadN(ctx context.Context, n int) ([]opencdc.Record, error) {
 	recs, err := c.currentIterator.ReadN(ctx, n)
 	if errors.Is(err, ErrSnapshotIteratorDone) {
+		// Check if we're in snapshot-only mode
+		if c.snapshotMode == "initial_only" {
+			sdk.Logger(ctx).Info().Msg("snapshot completed in initial_only mode, returning EOF to stop pipeline")
+			return nil, io.EOF
+		}
 		c.currentIterator = c.cdcIterator
 		//nolint:wrapcheck // error already wrapped in iterator
 		return c.currentIterator.ReadN(ctx, n)

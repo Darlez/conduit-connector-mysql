@@ -15,6 +15,33 @@ In snapshot mode, the record payload consists of
 [opencdc.StructuredData](https://conduit.io/docs/using/opencdc-record#structured-data),
 with each key being a column and each value being that column's value.
 
+#### Snapshot Modes
+
+The connector supports different snapshot modes via the `snapshot.mode` configuration parameter:
+
+- **`initial`** (default): Performs a snapshot of the data and then continues with CDC mode to capture ongoing changes.
+- **`initial_only`**: Performs a snapshot of the data and stops once the snapshot is complete. This is useful when:
+  - Reading from a read-only database where CDC/binlog is not available
+  - Doing one-time data migrations
+  - Creating point-in-time backups
+
+Example configuration for snapshot-only mode:
+
+```yaml
+version: 2.2
+pipelines:
+  - id: mysql-snapshot-only
+    status: running
+    connectors:
+      - id: mysql-source
+        plugin: "mysql"
+        settings:
+          dsn: "user:password@tcp(localhost:3306)/mydb"
+          tables: "users,orders"
+          snapshot.enabled: "true"
+          snapshot.mode: "initial_only"
+```
+
 ### Change Data Capture mode
 
 When the connector switches to CDC mode, it starts streaming changes from the
@@ -189,6 +216,12 @@ pipelines:
           # Type: bool
           # Required: no
           snapshot.enabled: "true"
+          # Specifies the snapshot mode. Supported values: "initial" (snapshot
+          # then CDC, default) or "initial_only" (snapshot only, stop after
+          # completion).
+          # Type: string
+          # Required: no
+          snapshot.mode: "initial"
           # Limits how many rows should be retrieved on each database fetch on
           # snapshot mode.
           # Type: int
@@ -311,6 +344,32 @@ pipelines:
           sdk.schema.extract.payload.enabled: "true"
 ```
 <!-- /readmegen:destination.parameters.yaml -->
+
+## Automatic Shutdown After Snapshot Completion
+
+When using `snapshot.mode: "initial_only"`, the pipeline will stop automatically after completing the snapshot. To shut down the entire Conduit service at this point, use the provided monitoring script:
+
+```bash
+# Basic usage
+./scripts/conduit-monitor.sh
+
+# Monitor specific pipeline
+./scripts/conduit-monitor.sh mysql-snapshot
+
+# Full configuration
+./scripts/conduit-monitor.sh mysql-snapshot http://localhost:8080/v1 /usr/local/bin/conduit
+```
+
+This script will:
+1. Start Conduit in the background
+2. Wait for the pipeline to complete
+3. Gracefully shut down Conduit
+
+See [scripts/README.md](scripts/README.md) for detailed documentation including:
+- Docker Compose integration
+- Systemd service setup
+- Cron job configuration
+- Troubleshooting guide
 
 ## Testing
 

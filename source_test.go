@@ -27,3 +27,52 @@ func TestSource_Teardown(t *testing.T) {
 	err := con.Teardown(context.Background())
 	is.NoErr(err)
 }
+
+func TestSourceConfig_Validate_SnapshotMode(t *testing.T) {
+	tests := []struct {
+		name         string
+		snapshotMode string
+		wantErr      bool
+	}{
+		{
+			name:         "default mode initial",
+			snapshotMode: "initial",
+			wantErr:      false,
+		},
+		{
+			name:         "snapshot only mode",
+			snapshotMode: "initial_only",
+			wantErr:      false,
+		},
+		{
+			name:         "invalid mode",
+			snapshotMode: "invalid_mode",
+			wantErr:      true,
+		},
+		{
+			name:         "empty mode",
+			snapshotMode: "",
+			wantErr:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := is.New(t)
+			cfg := SourceConfig{
+				Config: Config{
+					DSN: "user:password@tcp(localhost:3306)/testdb",
+				},
+				Tables:       []string{"*"},
+				SnapshotMode: tt.snapshotMode,
+			}
+
+			err := cfg.Validate(context.Background())
+			if tt.wantErr {
+				is.True(err != nil)
+			} else {
+				is.NoErr(err)
+			}
+		})
+	}
+}
