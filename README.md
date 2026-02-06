@@ -19,28 +19,9 @@ with each key being a column and each value being that column's value.
 
 The connector supports different snapshot modes via the `snapshot.mode` configuration parameter:
 
-- **`initial`** (default): Performs a snapshot of the data and then continues with CDC mode to capture ongoing changes.
-- **`initial_only`**: Performs a snapshot of the data and stops once the snapshot is complete. This is useful when:
-  - Reading from a read-only database where CDC/binlog is not available
-  - Doing one-time data migrations
-  - Creating point-in-time backups
-
-Example configuration for snapshot-only mode:
-
-```yaml
-version: 2.2
-pipelines:
-  - id: mysql-snapshot-only
-    status: running
-    connectors:
-      - id: mysql-source
-        plugin: "mysql"
-        settings:
-          dsn: "user:password@tcp(localhost:3306)/mydb"
-          tables: "users,orders"
-          snapshot.enabled: "true"
-          snapshot.mode: "initial_only"
-```
+- **initial** (default): Performs a snapshot of the data and then continues with CDC mode.
+- **initial_only**: Performs a snapshot of the data and stops once complete. Useful for read-only databases
+  or one-time data migrations.
 
 ### Change Data Capture mode
 
@@ -58,17 +39,6 @@ The position of the table is currently not recorded, so the unsafe snapshot will
 ### Schema
 
 The source connector uses [avro](https://avro.apache.org/docs/1.11.1/specification/) to decode mysql rows. Here's the MySQL datatype to avro datatype equivalence that the connector uses:
-
-#### Nullable Columns
-
-The connector properly preserves `NULL` values for nullable columns in both snapshot and CDC modes:
-
-- **Snapshot mode**: Column nullability is determined from `sqlx.ColumnTypes` metadata returned by the database driver
-- **CDC mode**: Column nullability is queried from `information_schema.columns` and cached for performance
-
-For nullable columns, the connector creates Avro [union schemas](https://avro.apache.org/docs/1.11.1/specification/#unions) with the format `["null", "type"]`, where `type` is the mapped Avro type from the table below. This allows records to contain either a null value or the actual data type.
-
-**Note**: Non-nullable columns always use the primitive Avro types shown below, while nullable columns use union types.
 
 | MySQL Type | Avro Type |
 | ---------- | --------- |
@@ -216,17 +186,18 @@ pipelines:
           # Type: bool
           # Required: no
           snapshot.enabled: "true"
-          # Specifies the snapshot mode. Supported values: "initial" (snapshot
-          # then CDC, default) or "initial_only" (snapshot only, stop after
-          # completion).
-          # Type: string
-          # Required: no
-          snapshot.mode: "initial"
           # Limits how many rows should be retrieved on each database fetch on
           # snapshot mode.
           # Type: int
           # Required: no
           snapshot.fetchSize: "10000"
+          # Specifies the snapshot mode. Supported values: - "initial": Takes a
+          # snapshot of the data and then continues with CDC (default). -
+          # "initial_only": Takes a snapshot of the data and stops after
+          # completion.
+          # Type: string
+          # Required: no
+          snapshot.mode: "initial"
           # Allows a snapshot of a table with neither a primary key nor a
           # defined sorting column. The opencdc.Position won't record the last
           # record read from a table.

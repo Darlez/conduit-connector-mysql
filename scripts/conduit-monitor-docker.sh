@@ -283,8 +283,16 @@ check_logs_for_errors() {
     fi
     
     # Count error messages (pattern: " ERR ")
+    # Use printf to ensure clean integer output
     local error_count
-    error_count=$(grep -c " ERR " "$LOG_FILE" 2>/dev/null || echo "0")
+    error_count=$(grep -c " ERR " "$LOG_FILE" 2>/dev/null | head -1 || echo "0")
+    error_count=$(printf '%s' "$error_count" | tr -d '\n\r')
+    
+    # Validate error_count is a number
+    if ! [[ "$error_count" =~ ^[0-9]+$ ]]; then
+        log_warn "Could not parse error count from logs, assuming no errors"
+        return 0
+    fi
     
     if [ "$error_count" -gt 0 ]; then
         log_error "Found $error_count error message(s) in logs"
